@@ -19,6 +19,7 @@ class PowerControlScheduler(BatsimScheduler):
         
         self.waiting_jobs = []           # 等待队列
         self.running_jobs = []           # 运行中的作业
+        self.simulation_started = False  # 添加标志，表示是否已经开始接收作业
 
     def onAfterBatsimInit(self):
         """初始化调度器"""
@@ -28,16 +29,16 @@ class PowerControlScheduler(BatsimScheduler):
         super().onSimulationBegins()
         """模拟开始时的回调"""
         print("Simulation begins at time:", self.bs.time())
-        super().onSimulationBegins()
         
         # 初始化电源控制器
         self.power_controller = NodePowerController(batsim_scheduler=self.bs)
         
         # 初始化时间记录
         self.last_power_check = self.bs.time()
+        self.simulation_started = False  # 添加标志，表示是否已经开始接收作业
         
         # 设置第一次回调
-        self.schedule_next_record()
+        # self.schedule_next_record()
 
     def schedule_next_record(self):
         """设置下一次回调的时间（每分钟）"""
@@ -55,7 +56,7 @@ class PowerControlScheduler(BatsimScheduler):
             self.last_power_check = current_time
         
         # 请求能耗数据并记录系统状态（每次回调都执行）
-        self.bs.request_consumed_energy()
+        # self.bs.request_consumed_energy()
         self.power_controller.RecordSystemState(
             current_time,
             self.running_jobs,
@@ -63,16 +64,24 @@ class PowerControlScheduler(BatsimScheduler):
             self.current_power
         )
         
-        # 设置下一次回调时间
+        # 如果已经开始接收作业，且没有运行或等待的作业，则不再设置回调
+        if self.simulation_started and not (self.running_jobs or self.waiting_jobs):
+            print(f"[Time {current_time}] All jobs completed, stopping callbacks")
+            return
+        
         self.schedule_next_record()
 
     def onJobSubmission(self, job):
         """处理作业提交"""
+        self.simulation_started = True  # 标记已经开始接收作业
+        
         if job.requested_resources > self.bs.nb_resources:
             self.bs.reject_jobs([job])
             return
             
         self.waiting_jobs.append(job)
+        print(f"[Time {self.bs.time()}] Job {job.id} submitted. "
+              f"Waiting jobs: {len(self.waiting_jobs)}, Running jobs: {len(self.running_jobs)}")
         self.try_schedule_jobs()
 
     def onJobCompletion(self, job):
@@ -80,15 +89,18 @@ class PowerControlScheduler(BatsimScheduler):
         if job in self.running_jobs:
             self.running_jobs.remove(job)
             
-        print("onJobCompletion job.allocation {} for job: {}".format(job.allocation, job.id))
+        print(f"[Time {self.bs.time()}] Job {job.id} completed. "
+              f"Allocation: {job.allocation}, "
+              f"Waiting jobs: {len(self.waiting_jobs)}, Running jobs: {len(self.running_jobs)}")
+        
         for node in job.allocation:
             self.power_controller.RemoveJobFromNode(node)
-            
-        # 尝试调度等待的作业
+        
         self.try_schedule_jobs()
 
     def onJobKilled(self, job):
         """处理作业被杀死"""
+        assert False, "onJobKilled is called"
         if job in self.running_jobs:
             self.running_jobs.remove(job)
         for node in job.allocation:
@@ -129,42 +141,71 @@ class PowerControlScheduler(BatsimScheduler):
         super().onSimulationEnds()
 
     def try_schedule_jobs(self):
-        """尝试调度等待队列中的作业（FCFS算法）"""
+        """尝试调度等待队列中的作业（FCFS算法 + 负载均衡）"""
         if not self.waiting_jobs:
             return
+        
+        print(f"\n[Time {self.bs.time()}] Attempting to schedule jobs...")
+        print(f"Current state: Waiting jobs: {len(self.waiting_jobs)}, Running jobs: {len(self.running_jobs)}")
             
         # 获取可用节点（只考虑ACTIVE和IDLE状态的节点）
         available_nodes = self.power_controller.GetAvailableNodes()
         if not available_nodes:
-            return
+            print(f"[Time {self.bs.time()}] No available nodes for scheduling")
+            assert False, "No available nodes"
             
+        print(f"Available nodes: {len(available_nodes)}")
+        
+        # 获取节点负载信息
+        node_loads = {node: self.power_controller.GetNodeJobCount(node) 
+                     for node in available_nodes}
+        
         jobs_to_execute = []
         remaining_nodes = available_nodes.copy()
         
-        i = 0
-        while i < len(self.waiting_jobs):
-            job = self.waiting_jobs[i]
-            
-            # 检查是否有足够的节点
+        # 遍历等待队列，尝试调度尽可能多的作业
+        waiting_jobs_copy = self.waiting_jobs.copy()
+        self.waiting_jobs = []
+        
+        for job in waiting_jobs_copy:
             if job.requested_resources <= len(remaining_nodes):
-                # 分配资源
-                selected_nodes = remaining_nodes[:job.requested_resources]
+                # 按负载排序节点，优先使用负载低的节点
+                sorted_nodes = sorted(remaining_nodes, 
+                                    key=lambda n: (node_loads[n], n))  # 使用节点ID作为次要排序键
+                
+                # 选择负载最低的节点
+                selected_nodes = sorted_nodes[:job.requested_resources]
                 job.allocation = ProcSet(*selected_nodes)
                 
-                # 更新节点状态和作业数量
+                # 更新节点状态和负载
                 for node in selected_nodes:
                     self.power_controller.AddJobToNode(node)
+                    node_loads[node] += 1  # 更新本地负载记录
                 
-                # 从可用节点列表和等待队列中移除
-                remaining_nodes = remaining_nodes[job.requested_resources:]
-                self.waiting_jobs.pop(i)
+                # 从可用节点列表中移除已分配的节点
+                remaining_nodes = [n for n in remaining_nodes if n not in selected_nodes]
                 
-                # 添加到待执行列表和运行队列
                 jobs_to_execute.append(job)
                 self.running_jobs.append(job)
+                
+                print(f"[Time {self.bs.time()}] Scheduled job {job.id} on nodes {selected_nodes}")
+                print(f"Node loads after scheduling: {', '.join(f'node {n}: {node_loads[n]}' for n in selected_nodes)}")
             else:
-                i += 1
+                self.waiting_jobs.append(job)
+                print(f"[Time {self.bs.time()}] Could not schedule job {job.id} "
+                      f"(needs {job.requested_resources} nodes, only {len(remaining_nodes)} available)")
                 
         # 执行作业
         if jobs_to_execute:
+            print(f"[Time {self.bs.time()}] Executing {len(jobs_to_execute)} jobs")
             self.bs.execute_jobs(jobs_to_execute)
+        
+        # 打印节点负载分布
+        if available_nodes:
+            load_distribution = {}
+            for load in node_loads.values():
+                load_distribution[load] = load_distribution.get(load, 0) + 1
+            print(f"Node load distribution: {dict(sorted(load_distribution.items()))}")
+        
+        print(f"After scheduling: Waiting jobs: {len(self.waiting_jobs)}, "
+              f"Running jobs: {len(self.running_jobs)}\n")

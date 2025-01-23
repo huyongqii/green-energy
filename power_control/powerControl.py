@@ -32,19 +32,20 @@ class NodePowerController:
                  min_uptime: int = 600,      # 最短开机保持时长(秒)
                  min_downtime: int = 300,    # 最短关机保持时长(秒)
                  sleep_threshold: int = 2160000,  # 空闲超过6小时转为关机
-                 buffer_ratio: float = 0.1,  # 冗余比例
-                 batch_size: int = 5):        # 每批次最大调整数量
+                 buffer_ratio: float = 0.1,  # 预测值的冗余比例
+                 idle_reserve_ratio: float = 0.05,  # 最小空闲节点保留比例
+                 redundancy_node_num: int = 10,  # 冗余节点数量
+                 batch_size: int = 30):        # 每批次最大调整数量
         self.bs = batsim_scheduler
         self.predictor_url = predictor_url
         self.min_uptime = min_uptime
         self.min_downtime = min_downtime
         self.sleep_threshold = sleep_threshold
         self.buffer_ratio = buffer_ratio
+        self.idle_reserve_ratio = idle_reserve_ratio
         self.batch_size = batch_size
-        # 添加功率相关的属性
-        self.last_energy = 0.0        # 上次能耗值
-        self.last_energy_time = 0.0   # 上次能耗时间
-        self.current_power = 0.0      # 当前功率
+        self.redundancy_node_num = redundancy_node_num
+        self.power_check_interval = 30  # 每分钟检查一次
 
         if os.path.exists('record.csv'):
             os.remove('record.csv')
@@ -302,30 +303,60 @@ class NodePowerController:
                             sleeping_nodes: List[str],
                             powered_off_nodes: List[str]) -> Tuple[List[str], List[str]]:
         """决定需要唤醒的节点（包括从睡眠唤醒和从关机启动）"""
-        if predicted_active <= current_active:
+        # 计算当前可用节点总数（活跃+空闲）
+        current_idle = len(self.GetIdleNodes())
+        total_available = current_active + current_idle
+        
+        # 计算负载变化率（每分钟变化的节点数）
+        load_change_rate = (predicted_active - current_active) / self.power_check_interval
+        
+        # 根据变化率动态调整冗余节点数量
+        dynamic_redundancy = max(
+            self.redundancy_node_num,  # 基础冗余数量
+            int(abs(load_change_rate) * self.power_check_interval * 1.5)  # 根据变化速率调整
+        )
+        
+        # 计算最小需要的空闲节点数
+        min_idle_nodes = max(2, int(self.bs.nb_resources * self.idle_reserve_ratio))
+        
+        # 判断是否需要唤醒节点的条件：
+        # 1. 预测的活跃节点数 > 当前可用节点总数，或
+        # 2. 当前空闲节点数 < 最小所需空闲节点数
+        need_wakeup = (predicted_active >= total_available) or (current_idle < min_idle_nodes)
+        
+        if not need_wakeup:
             return [], []
-            
-        # 计算需要额外的节点数量（包含冗余）
-        needed = int((predicted_active - current_active) * (1 + self.buffer_ratio))
-        needed = min(needed, self.batch_size)  # 应用批次限制
+        
+        # 计算需要唤醒的节点数量
+        needed = max(
+            predicted_active - total_available + dynamic_redundancy,  # 预测需求 + 动态冗余
+            min_idle_nodes - current_idle  # 补充最小空闲数量
+        )
+        
+        if needed <= 0:
+            return [], []
         
         # 优先从睡眠节点中唤醒
-        current_time = self.bs.time()
         nodes_to_wake = []
         nodes_to_power_on = []
         
-        # 先尝试唤醒睡眠节点
-        if needed > 0:
+        if sleeping_nodes:
             nodes_to_wake = sleeping_nodes[:needed]
             needed -= len(nodes_to_wake)
         
-        # 如果睡眠节点不够，再从关机节点中选择
-        if needed > 0:
-            eligible_nodes = [
-                node for node in powered_off_nodes
-                if current_time - self.node_states[node]['last_state_change'] >= self.min_downtime
-            ]
-            nodes_to_power_on = eligible_nodes[:needed]
+        if needed > 0 and powered_off_nodes:
+            nodes_to_power_on = powered_off_nodes[:needed]
+        
+        print(f"[Time {self.bs.time()}] Wake-up decision:"
+              f"\n  Current active: {current_active}"
+              f"\n  Current idle: {current_idle}"
+              f"\n  Total available: {total_available}"
+              f"\n  Predicted active: {predicted_active}"
+              f"\n  Load change rate: {load_change_rate:.2f} nodes/min"
+              f"\n  Dynamic redundancy: {dynamic_redundancy}"
+              f"\n  Min idle required: {min_idle_nodes}"
+              f"\n  Nodes needed: {needed}"
+              f"\n  Waking up: {len(nodes_to_wake)} sleeping, {len(nodes_to_power_on)} powered-off")
         
         return nodes_to_wake, nodes_to_power_on
     
@@ -334,30 +365,65 @@ class NodePowerController:
                                      current_active: int,
                                      idle_nodes: List[str]) -> Tuple[List[str], List[str]]:
         """决定需要睡眠或关机的节点"""
-        if predicted_active >= current_active:
+        if not idle_nodes:
             return [], []
-            
-        # 计算需要减少的数量（保留冗余）
-        excess = current_active - predicted_active
-        to_reduce = int(excess * (1 - self.buffer_ratio))
-        # to_reduce = min(to_reduce, self.batch_size)  # 应用批次限制
         
+        # 计算负载变化率
+        load_change_rate = (predicted_active - current_active) / self.power_check_interval
+        
+        # 根据负载变化趋势调整buffer ratio
+        if load_change_rate > 0:
+            # 负载上升趋势，更保守地减少节点
+            adjusted_buffer = self.buffer_ratio * 1.5
+        else:
+            # 负载下降趋势，更激进地减少节点
+            adjusted_buffer = self.buffer_ratio * 0.8
+        
+        # 调整预测值，添加buffer
+        adjusted_predicted = int(predicted_active * (1 + adjusted_buffer))
+        
+        # 计算需要保留的空闲节点数量
+        min_idle_nodes = max(2, int(self.bs.nb_resources * self.idle_reserve_ratio))
+        current_idle = len(idle_nodes)
+        
+        # 计算最小需要保留的可用节点总数
+        min_total_available = max(
+            adjusted_predicted + min_idle_nodes,  # 预测值 + 最小空闲数量
+            current_active + min_idle_nodes       # 当前活跃 + 最小空闲数量
+        )
+        
+        # 计算可以休眠的节点数量
+        total_available = current_active + current_idle
+        nodes_can_sleep = total_available - min_total_available
+        
+        # 确保休眠后仍保持最小空闲节点数
+        max_can_sleep = current_idle - min_idle_nodes
+        nodes_can_sleep = min(nodes_can_sleep, max_can_sleep)
+        
+        if nodes_can_sleep <= 0:
+            return [], []
+        
+        print(f"[Time {self.bs.time()}] Sleep decision:"
+              f"\n  Current active: {current_active}"
+              f"\n  Current idle: {current_idle}"
+              f"\n  Predicted active: {predicted_active}"
+              f"\n  Adjusted predicted: {adjusted_predicted}"
+              f"\n  Load change rate: {load_change_rate:.2f} nodes/min"
+              f"\n  Adjusted buffer ratio: {adjusted_buffer:.2f}"
+              f"\n  Min idle required: {min_idle_nodes}"
+              f"\n  Min total available: {min_total_available}"
+              f"\n  Can sleep: {nodes_can_sleep}"
+              f"\n  Idle nodes after sleep: {current_idle - nodes_can_sleep}")
+        
+        # 根据空闲时长决定节点去向
         current_time = self.bs.time()
         nodes_to_sleep = []
         nodes_to_shutdown = []
         
-        # 检查每个空闲节点的状态
-        for node in idle_nodes[:to_reduce]:
-            if node not in self.node_states:
-                nodes_to_sleep.append(node)
-                continue
-                
+        for node in idle_nodes[:nodes_can_sleep]:
             idle_time = current_time - self.node_states[node]['last_state_change']
-            
-            # 如果空闲时间超过阈值，则关机
             if idle_time >= self.sleep_threshold:
                 nodes_to_shutdown.append(node)
-            # 否则进入睡眠状态
             else:
                 nodes_to_sleep.append(node)
         
@@ -369,22 +435,20 @@ class NodePowerController:
                            idle_nodes: List[str],
                            sleeping_nodes: List[str],
                            powered_off_nodes: List[str]) -> Tuple[List[str], List[str], List[str], List[str]]:
-        """
-        根据预测值和当前状态做出节点状态转换决策
-        
-        返回值:
-            Tuple[List[str], List[str], List[str], List[str]]: 
-            (要唤醒的睡眠节点列表, 要开机的关机节点列表, 要睡眠的节点列表, 要关机的节点列表)
-        """
-        # 处理需要增加活跃节点的情况
+        """根据预测值和当前状态做出节点状态转换决策"""
+        # 首先检查是否需要唤醒节点
         nodes_to_wake, nodes_to_power_on = self._get_nodes_to_wake_up(
             predicted_active, current_active, sleeping_nodes, powered_off_nodes)
         
-        # 处理需要减少活跃节点的情况
+        # 如果需要唤醒节点，直接返回
+        if nodes_to_wake or nodes_to_power_on:
+            return nodes_to_wake, nodes_to_power_on, [], []
+        
+        # 否则考虑让节点睡眠
         nodes_to_sleep, nodes_to_shutdown = self._get_nodes_to_sleep_or_shutdown(
             predicted_active, current_active, idle_nodes)
-            
-        return nodes_to_wake, nodes_to_power_on, nodes_to_sleep, nodes_to_shutdown
+        
+        return [], [], nodes_to_sleep, nodes_to_shutdown
 
     def RecordSystemState(self, current_time: float, running_jobs: list, waiting_jobs: list, current_power: float):
         """
